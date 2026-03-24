@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use fs_extra::dir::{CopyOptions, TransitProcess, copy_with_progress};
 use human_bytes::human_bytes;
 use ml_progress::progress;
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Parser)]
@@ -20,6 +22,14 @@ enum Cmd {
     List,
     /// Interactively select and restore a backup to the OP-Z
     Restore,
+    /// Show what changed between the two most recent backups
+    Diff,
+    /// Show OP-Z connection state and last backup info
+    Status,
+    /// Open a backup folder in Finder / file manager
+    Open,
+    /// Watch for OP-Z connection and auto-backup on plug-in
+    Watch,
 }
 
 fn hb(n: u64) -> String { human_bytes(n as f64) }
@@ -96,6 +106,29 @@ fn opz_mount() -> Result<String, String> {
         .ok_or_else(|| "No OP-Z (turn off, press I, turn on, plug USB)".to_string())
 }
 
+// Returns relative-path → size for every file under root (iterative, no recursion)
+fn walk_dir(root: &Path) -> BTreeMap<String, u64> {
+    let mut map = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path.strip_prefix(root).ok()
+                    .and_then(|p| p.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                map.insert(rel, meta.len());
+            }
+        }
+    }
+    map
+}
+
 fn run() -> Result<u64, String> {
     let src = opz_mount()?;
     let dst = format!("{}/{}", backup_root(), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
@@ -122,6 +155,93 @@ fn list_backups() -> Result<(), String> {
         println!("  {}   {}", name, hb(*size));
     }
 
+    Ok(())
+}
+
+fn diff_backups() -> Result<(), String> {
+    let names = backup_names()?;
+    if names.len() < 2 {
+        return Err("need at least 2 backups to diff".to_string());
+    }
+
+    let root = backup_root();
+    let a_name = &names[names.len() - 2];
+    let b_name = &names[names.len() - 1];
+    let a = walk_dir(Path::new(&format!("{}/{}", root, a_name)));
+    let b = walk_dir(Path::new(&format!("{}/{}", root, b_name)));
+
+    println!("{} → {}\n", a_name, b_name);
+
+    let mut new_count = 0u32;
+    let mut del_count = 0u32;
+    let mut mod_count = 0u32;
+
+    for (path, &size) in &a {
+        if !b.contains_key(path) {
+            println!("  - {}  {}", path, hb(size));
+            del_count += 1;
+        }
+    }
+    for (path, &size) in &b {
+        match a.get(path) {
+            None => { println!("  + {}  {}", path, hb(size)); new_count += 1; }
+            Some(&old) if old != size => { println!("  ~ {}  {} → {}", path, hb(old), hb(size)); mod_count += 1; }
+            _ => {}
+        }
+    }
+
+    if new_count + del_count + mod_count == 0 {
+        println!("  no changes");
+    } else {
+        println!("\n  {} change{}  ({} new, {} modified, {} deleted)",
+            new_count + del_count + mod_count,
+            if new_count + del_count + mod_count == 1 { "" } else { "s" },
+            new_count, mod_count, del_count);
+    }
+
+    Ok(())
+}
+
+fn status() -> Result<(), String> {
+    match opz_mount() {
+        Ok(path) => println!("OP-Z    connected   {}", path),
+        Err(_)   => println!("OP-Z    not connected"),
+    }
+
+    let root = backup_root();
+    let entries = load_backups().unwrap_or_default();
+    if entries.is_empty() {
+        println!("backup  no backups yet");
+        println!("root    {}", root);
+    } else {
+        let last = entries.last().unwrap();
+        let total: u64 = entries.iter().map(|(_, s)| s).sum();
+        let n = entries.len();
+        println!("backup  {} backup{}   last: {}  ({})",
+            n, if n == 1 { "" } else { "s" }, last.0, hb(last.1));
+        println!("root    {}   ({} total)", root, hb(total));
+    }
+
+    Ok(())
+}
+
+fn open_backup() -> Result<(), String> {
+    let names = backup_names()?;
+    if names.is_empty() {
+        return Err(format!("no backups in {}", backup_root()));
+    }
+
+    let theme = dialoguer::theme::ColorfulTheme::default();
+    let idx = dialoguer::Select::with_theme(&theme)
+        .with_prompt("Select backup to open")
+        .items(&names)
+        .default(names.len() - 1)
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    let path = format!("{}/{}", backup_root(), names[idx]);
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener).arg(&path).status().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -161,11 +281,42 @@ fn restore() -> Result<(), String> {
     Ok(())
 }
 
+fn watch() -> Result<(), String> {
+    // Initialise to current state so we only trigger on new plug-ins
+    let mut was_connected = opz_mount().is_ok();
+    if was_connected {
+        println!("OP-Z already connected — will back up on next reconnect");
+    } else {
+        println!("Watching for OP-Z... (Ctrl+C to stop)");
+    }
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let connected = opz_mount().is_ok();
+
+        if connected && !was_connected {
+            println!("OP-Z connected — backing up...");
+            match run() {
+                Ok(b)  => println!("✓ {} copied — watching...", hb(b)),
+                Err(e) => eprintln!("✗ {} — watching...", e),
+            }
+        } else if !connected && was_connected {
+            println!("OP-Z disconnected — watching...");
+        }
+
+        was_connected = connected;
+    }
+}
+
 fn main() {
     let result: Result<(), String> = match Cli::parse().command {
-        None                => run().map(|b| println!("✓ {} copied", hb(b))),
-        Some(Cmd::List)     => list_backups(),
-        Some(Cmd::Restore)  => restore(),
+        None                 => run().map(|b| println!("✓ {} copied", hb(b))),
+        Some(Cmd::List)      => list_backups(),
+        Some(Cmd::Restore)   => restore(),
+        Some(Cmd::Diff)      => diff_backups(),
+        Some(Cmd::Status)    => status(),
+        Some(Cmd::Open)      => open_backup(),
+        Some(Cmd::Watch)     => watch(),
     };
     if let Err(e) = result {
         eprintln!("✗ {}", e);
@@ -335,6 +486,43 @@ devfs                396        396          0     100% /dev";
         assert!(backup_copy("/nonexistent/path/opz", dst.path().to_str().unwrap(), false).is_err());
     }
 
+    // ── walk_dir ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn walk_dir_collects_files_with_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"hello").unwrap();
+        fs::write(root.path().join("b.txt"), b"world!!").unwrap();
+
+        let map = walk_dir(root.path());
+        assert_eq!(map.get("a.txt"), Some(&5));
+        assert_eq!(map.get("b.txt"), Some(&7));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn walk_dir_collects_nested_files() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("sub")).unwrap();
+        fs::write(root.path().join("top.txt"), b"top").unwrap();
+        fs::write(root.path().join("sub").join("deep.txt"), b"deep").unwrap();
+
+        let map = walk_dir(root.path());
+        assert_eq!(map.get("top.txt"), Some(&3));
+        assert_eq!(map.get("sub/deep.txt"), Some(&4));
+    }
+
+    #[test]
+    fn walk_dir_empty_dir_returns_empty_map() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(walk_dir(root.path()).is_empty());
+    }
+
+    #[test]
+    fn walk_dir_missing_dir_returns_empty_map() {
+        assert!(walk_dir(Path::new("/nonexistent/path")).is_empty());
+    }
+
     // ── load_backups / list_backups ──────────────────────────────────────────
 
     #[test]
@@ -384,6 +572,34 @@ devfs                396        396          0     100% /dev";
         fs::create_dir_all(root.path().join("opz-backups")).unwrap();
 
         assert!(list_backups().is_ok());
+    }
+
+    // ── diff_backups ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_backups_errors_with_fewer_than_two() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", root.path()) };
+        fs::create_dir_all(root.path().join("opz-backups").join("2026-03-20_10-00-00")).unwrap();
+        assert!(diff_backups().is_err());
+    }
+
+    #[test]
+    fn diff_backups_ok_with_two_backups() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", root.path()) };
+
+        let b1 = root.path().join("opz-backups").join("2026-03-20_10-00-00");
+        let b2 = root.path().join("opz-backups").join("2026-03-24_14-30-00");
+        fs::create_dir_all(&b1).unwrap();
+        fs::create_dir_all(&b2).unwrap();
+        fs::write(b1.join("same.txt"), b"unchanged").unwrap();
+        fs::write(b2.join("same.txt"), b"unchanged").unwrap();
+        fs::write(b2.join("new.txt"), b"added").unwrap();
+
+        assert!(diff_backups().is_ok());
     }
 
     // ── backup_root ──────────────────────────────────────────────────────────
