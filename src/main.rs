@@ -34,24 +34,66 @@ fn backup_copy(src: &str, dst: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+fn backup_root() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{}/opz-backups", home)
+}
+
 fn run() -> Result<u64, String> {
     let output = Command::new("df").arg("-P").output().map_err(|e| e.to_string())?;
     let df = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
 
     let src = find_opz(&df).ok_or("No OP-Z (turn off, press I, turn on, plug USB)")?;
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dst = format!("{}/opz-backups/{}", home, chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    let dst = format!("{}/{}", backup_root(), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
     println!("→ {}", dst);
 
     std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
     backup_copy(src, &dst)
 }
 
+fn list_backups() -> Result<(), String> {
+    let root = backup_root();
+
+    let mut entries: Vec<(String, u64)> = std::fs::read_dir(&root)
+        .map_err(|_| format!("no backups found ({})", root))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let size = fs_extra::dir::get_size(e.path()).ok()?;
+            Some((name, size))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        println!("no backups in {}", root);
+        return Ok(());
+    }
+
+    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+
+    let total: u64 = entries.iter().map(|(_, s)| s).sum();
+    let n = entries.len();
+    println!("{} backup{}  ({})\n", n, if n == 1 { "" } else { "s" }, human_bytes(total as f64));
+
+    for (name, size) in &entries {
+        let date = chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%d_%H-%M-%S")
+            .map(|dt| dt.format("%a %b %e %Y  %H:%M").to_string())
+            .unwrap_or_else(|_| name.clone());
+        println!("  {}   {}", date, human_bytes(*size as f64));
+    }
+
+    Ok(())
+}
+
 fn main() {
-    match run() {
-        Ok(b) => println!("✓ {} copied", human_bytes(b as f64)),
-        Err(e) => eprintln!("✗ {}", e),
+    let result: Result<(), String> = match std::env::args().nth(1).as_deref() {
+        Some("list") => list_backups(),
+        _ => run().map(|b| println!("✓ {} copied", human_bytes(b as f64))),
+    };
+    if let Err(e) = result {
+        eprintln!("✗ {}", e);
     }
 }
 
@@ -59,6 +101,10 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate HOME to avoid races with parallel test runner
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     // Realistic df -P output (POSIX: 6 cols, mount point always at index 5)
     const DF_WITH_OPZ: &str = "\
@@ -216,5 +262,59 @@ devfs                396        396          0     100% /dev";
         let dst = tempfile::tempdir().unwrap();
         let result = backup_copy("/nonexistent/path/opz", dst.path().to_str().unwrap());
         assert!(result.is_err());
+    }
+
+    // ── list_backups ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_backups_errors_when_root_missing() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HOME", "/nonexistent/path/that/does/not/exist") };
+        let result = list_backups();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no backups found"));
+    }
+
+    #[test]
+    fn list_backups_ok_with_valid_dirs() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", root.path()) };
+
+        // Create two fake timestamped backup dirs with a file each
+        let b1 = root.path().join("opz-backups").join("2026-03-20_10-00-00");
+        let b2 = root.path().join("opz-backups").join("2026-03-24_14-30-00");
+        fs::create_dir_all(&b1).unwrap();
+        fs::create_dir_all(&b2).unwrap();
+        fs::write(b1.join("data.bin"), vec![0u8; 100]).unwrap();
+        fs::write(b2.join("data.bin"), vec![0u8; 200]).unwrap();
+
+        assert!(list_backups().is_ok());
+    }
+
+    #[test]
+    fn list_backups_ok_when_dir_empty() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", root.path()) };
+        fs::create_dir_all(root.path().join("opz-backups")).unwrap();
+
+        assert!(list_backups().is_ok());
+    }
+
+    // ── backup_root ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn backup_root_uses_home() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HOME", "/tmp/testhome") };
+        assert_eq!(backup_root(), "/tmp/testhome/opz-backups");
+    }
+
+    #[test]
+    fn backup_root_falls_back_to_dot() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(backup_root(), "./opz-backups");
     }
 }
