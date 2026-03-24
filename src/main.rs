@@ -71,17 +71,18 @@ fn list_backups() -> Result<(), String> {
         return Ok(());
     }
 
-    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    entries.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
 
     let total: u64 = entries.iter().map(|(_, s)| s).sum();
     let n = entries.len();
-    println!("{} backup{}  ({})\n", n, if n == 1 { "" } else { "s" }, human_bytes(total as f64));
+    println!("root   {}", root);
+    println!("total  {}  ({} backup{})\n", human_bytes(total as f64), n, if n == 1 { "" } else { "s" });
 
     for (name, size) in &entries {
         let date = chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%d_%H-%M-%S")
-            .map(|dt| dt.format("%a %b %e %Y  %H:%M").to_string())
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|_| name.clone());
-        println!("  {}   {}", date, human_bytes(*size as f64));
+        println!("  {}   {}   {}", name, date, human_bytes(*size as f64));
     }
 
     Ok(())
