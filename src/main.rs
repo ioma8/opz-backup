@@ -6,9 +6,8 @@ use std::process::Command;
 
 #[derive(Parser)]
 #[command(
-    name = "opz-backup",
-    about = "Back up and restore your OP-Z",
-    after_help = "With no subcommand, backs up the connected OP-Z to ~/opz-backups.",
+    version,
+    about = "Back up and restore your OP-Z (no subcommand = run backup)",
 )]
 struct Cli {
     #[command(subcommand)]
