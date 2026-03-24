@@ -3,6 +3,8 @@ use human_bytes::human_bytes;
 use ml_progress::progress;
 use std::process::Command;
 
+fn hb(n: u64) -> String { human_bytes(n as f64) }
+
 fn find_opz(df: &str) -> Option<&str> {
     df.lines()
         .skip(1)
@@ -39,10 +41,22 @@ fn backup_root() -> String {
     format!("{}/opz-backups", home)
 }
 
+fn backup_names() -> Result<Vec<String>, String> {
+    let root = backup_root();
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .map_err(|_| format!("no backups in {}", root))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 fn load_backups() -> Result<Vec<(String, u64)>, String> {
     let root = backup_root();
     let mut entries: Vec<(String, u64)> = std::fs::read_dir(&root)
-        .map_err(|_| format!("no backups found ({})", root))?
+        .map_err(|_| format!("no backups in {}", root))?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|e| {
@@ -83,37 +97,35 @@ fn list_backups() -> Result<(), String> {
     let total: u64 = entries.iter().map(|(_, s)| s).sum();
     let n = entries.len();
     println!("root   {}", root);
-    println!("total  {}  ({} backup{})\n", human_bytes(total as f64), n, if n == 1 { "" } else { "s" });
+    println!("total  {}  ({} backup{})\n", hb(total), n, if n == 1 { "" } else { "s" });
 
     for (name, size) in &entries {
-        println!("  {}   {}", name, human_bytes(*size as f64));
+        println!("  {}   {}", name, hb(*size));
     }
 
     Ok(())
 }
 
 fn restore() -> Result<(), String> {
-    let entries = load_backups()?;
-    if entries.is_empty() {
-        return Err(format!("no backups found in {}", backup_root()));
+    let names = backup_names()?;
+    if names.is_empty() {
+        return Err(format!("no backups in {}", backup_root()));
     }
 
-    let labels: Vec<String> = entries.iter()
-        .map(|(name, size)| format!("{}   {}", name, human_bytes(*size as f64)))
-        .collect();
+    let theme = dialoguer::theme::ColorfulTheme::default();
 
-    let idx = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+    let idx = dialoguer::Select::with_theme(&theme)
         .with_prompt("Select backup to restore")
-        .items(&labels)
-        .default(entries.len() - 1)
+        .items(&names)
+        .default(names.len() - 1)
         .interact()
         .map_err(|e| e.to_string())?;
 
-    let (name, _) = &entries[idx];
+    let name = &names[idx];
     let src = format!("{}/{}", backup_root(), name);
     let dst = opz_mount()?;
 
-    let confirmed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+    let confirmed = dialoguer::Confirm::with_theme(&theme)
         .with_prompt(format!("Restore {} → {}?", name, dst))
         .default(false)
         .interact()
@@ -126,7 +138,7 @@ fn restore() -> Result<(), String> {
 
     println!("→ restoring {} to {}", name, dst);
     let bytes = backup_copy(&src, &dst, true)?;
-    println!("✓ {} restored", human_bytes(bytes as f64));
+    println!("✓ {} restored", hb(bytes));
     Ok(())
 }
 
@@ -134,7 +146,7 @@ fn main() {
     let result: Result<(), String> = match std::env::args().nth(1).as_deref() {
         Some("list")    => list_backups(),
         Some("restore") => restore(),
-        _               => run().map(|b| println!("✓ {} copied", human_bytes(b as f64))),
+        _               => run().map(|b| println!("✓ {} copied", hb(b))),
     };
     if let Err(e) = result {
         eprintln!("✗ {}", e);
