@@ -14,7 +14,7 @@ fn pct(copied: u64, total: u64) -> u8 {
     if total == 0 { 0 } else { (copied * 100 / total) as u8 }
 }
 
-fn backup_copy(src: &str, dst: &str) -> Result<u64, String> {
+fn backup_copy(src: &str, dst: &str, overwrite: bool) -> Result<u64, String> {
     let bar = progress!(100).map_err(|e| e.to_string())?;
     let mut prev = 0u8;
 
@@ -28,7 +28,7 @@ fn backup_copy(src: &str, dst: &str) -> Result<u64, String> {
         fs_extra::dir::TransitProcessResult::ContinueOrAbort
     };
 
-    let bytes = copy_with_progress(src, dst, &CopyOptions::new().content_only(true), cb)
+    let bytes = copy_with_progress(src, dst, &CopyOptions::new().content_only(true).overwrite(overwrite), cb)
         .map_err(|e| e.to_string())?;
     bar.finish();
     Ok(bytes)
@@ -39,22 +39,8 @@ fn backup_root() -> String {
     format!("{}/opz-backups", home)
 }
 
-fn run() -> Result<u64, String> {
-    let output = Command::new("df").arg("-P").output().map_err(|e| e.to_string())?;
-    let df = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-
-    let src = find_opz(&df).ok_or("No OP-Z (turn off, press I, turn on, plug USB)")?;
-
-    let dst = format!("{}/{}", backup_root(), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
-    println!("→ {}", dst);
-
-    std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
-    backup_copy(src, &dst)
-}
-
-fn list_backups() -> Result<(), String> {
+fn load_backups() -> Result<Vec<(String, u64)>, String> {
     let root = backup_root();
-
     let mut entries: Vec<(String, u64)> = std::fs::read_dir(&root)
         .map_err(|_| format!("no backups found ({})", root))?
         .filter_map(|e| e.ok())
@@ -65,13 +51,34 @@ fn list_backups() -> Result<(), String> {
             Some((name, size))
         })
         .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+fn opz_mount() -> Result<String, String> {
+    let output = Command::new("df").arg("-P").output().map_err(|e| e.to_string())?;
+    let df = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    find_opz(&df)
+        .map(String::from)
+        .ok_or_else(|| "No OP-Z (turn off, press I, turn on, plug USB)".to_string())
+}
+
+fn run() -> Result<u64, String> {
+    let src = opz_mount()?;
+    let dst = format!("{}/{}", backup_root(), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+    println!("→ {}", dst);
+    std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+    backup_copy(&src, &dst, false)
+}
+
+fn list_backups() -> Result<(), String> {
+    let root = backup_root();
+    let entries = load_backups()?;
 
     if entries.is_empty() {
         println!("no backups in {}", root);
         return Ok(());
     }
-
-    entries.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
 
     let total: u64 = entries.iter().map(|(_, s)| s).sum();
     let n = entries.len();
@@ -79,19 +86,55 @@ fn list_backups() -> Result<(), String> {
     println!("total  {}  ({} backup{})\n", human_bytes(total as f64), n, if n == 1 { "" } else { "s" });
 
     for (name, size) in &entries {
-        let date = chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%d_%H-%M-%S")
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|_| name.clone());
-        println!("  {}   {}   {}", name, date, human_bytes(*size as f64));
+        println!("  {}   {}", name, human_bytes(*size as f64));
     }
 
     Ok(())
 }
 
+fn restore() -> Result<(), String> {
+    let entries = load_backups()?;
+    if entries.is_empty() {
+        return Err(format!("no backups found in {}", backup_root()));
+    }
+
+    let labels: Vec<String> = entries.iter()
+        .map(|(name, size)| format!("{}   {}", name, human_bytes(*size as f64)))
+        .collect();
+
+    let idx = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Select backup to restore")
+        .items(&labels)
+        .default(entries.len() - 1)
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    let (name, _) = &entries[idx];
+    let src = format!("{}/{}", backup_root(), name);
+    let dst = opz_mount()?;
+
+    let confirmed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!("Restore {} → {}?", name, dst))
+        .default(false)
+        .interact()
+        .map_err(|e| e.to_string())?;
+
+    if !confirmed {
+        println!("cancelled");
+        return Ok(());
+    }
+
+    println!("→ restoring {} to {}", name, dst);
+    let bytes = backup_copy(&src, &dst, true)?;
+    println!("✓ {} restored", human_bytes(bytes as f64));
+    Ok(())
+}
+
 fn main() {
     let result: Result<(), String> = match std::env::args().nth(1).as_deref() {
-        Some("list") => list_backups(),
-        _ => run().map(|b| println!("✓ {} copied", human_bytes(b as f64))),
+        Some("list")    => list_backups(),
+        Some("restore") => restore(),
+        _               => run().map(|b| println!("✓ {} copied", human_bytes(b as f64))),
     };
     if let Err(e) = result {
         eprintln!("✗ {}", e);
@@ -133,7 +176,6 @@ devfs                396        396          0     100% /dev";
 
     #[test]
     fn find_opz_skips_header_row() {
-        // Header line has "OP-Z" injected at mount column — must be ignored
         let df = "Filesystem 1 2 3 4 /Volumes/OP-Z\n\
                   /dev/disk1 100 50 50 50% /normal";
         assert_eq!(find_opz(df), None);
@@ -141,7 +183,6 @@ devfs                396        396          0     100% /dev";
 
     #[test]
     fn find_opz_matches_on_mount_column_not_filesystem() {
-        // "OP-Z" appears in the filesystem column (0), not the mount column (5)
         let df = "Filesystem     1024-blocks      Used  Available Capacity Mounted on\n\
                   /dev/OP-Z/s1   244277232   94712304  148564528      39% /other";
         assert_eq!(find_opz(df), None);
@@ -192,15 +233,12 @@ devfs                396        396          0     100% /dev";
 
     #[test]
     fn pct_truncates_not_rounds() {
-        // 1/3 = 33.33... should truncate to 33
         assert_eq!(pct(1, 3), 33);
-        // 2/3 = 66.66... should truncate to 66
         assert_eq!(pct(2, 3), 66);
     }
 
     #[test]
     fn pct_large_values_no_overflow() {
-        // copied * 100 could overflow u64 at ~184 PB — well outside real use
         let gb = 1024 * 1024 * 1024u64;
         assert_eq!(pct(gb, gb * 2), 50);
         assert_eq!(pct(gb * 2, gb * 2), 100);
@@ -219,9 +257,10 @@ devfs                396        396          0     100% /dev";
         let bytes = backup_copy(
             src.path().to_str().unwrap(),
             dst.path().to_str().unwrap(),
+            false,
         ).unwrap();
 
-        assert_eq!(bytes, 22); // 11 + 11
+        assert_eq!(bytes, 22);
         assert_eq!(fs::read(dst.path().join("a.txt")).unwrap(), b"hello world");
         assert_eq!(fs::read(dst.path().join("b.txt")).unwrap(), b"foo bar baz");
     }
@@ -230,13 +269,7 @@ devfs                396        396          0     100% /dev";
     fn backup_copy_empty_dir_returns_zero_bytes() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-
-        let bytes = backup_copy(
-            src.path().to_str().unwrap(),
-            dst.path().to_str().unwrap(),
-        ).unwrap();
-
-        assert_eq!(bytes, 0);
+        assert_eq!(backup_copy(src.path().to_str().unwrap(), dst.path().to_str().unwrap(), false).unwrap(), 0);
     }
 
     #[test]
@@ -247,33 +280,53 @@ devfs                396        396          0     100% /dev";
         fs::create_dir(src.path().join("subdir")).unwrap();
         fs::write(src.path().join("subdir").join("nested.txt"), b"nested").unwrap();
 
-        backup_copy(
-            src.path().to_str().unwrap(),
-            dst.path().to_str().unwrap(),
-        ).unwrap();
+        backup_copy(src.path().to_str().unwrap(), dst.path().to_str().unwrap(), false).unwrap();
 
-        assert_eq!(
-            fs::read(dst.path().join("subdir").join("nested.txt")).unwrap(),
-            b"nested"
-        );
+        assert_eq!(fs::read(dst.path().join("subdir").join("nested.txt")).unwrap(), b"nested");
+    }
+
+    #[test]
+    fn backup_copy_overwrites_when_flag_set() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        fs::write(src.path().join("f.txt"), b"new").unwrap();
+        fs::write(dst.path().join("f.txt"), b"old content longer").unwrap();
+
+        backup_copy(src.path().to_str().unwrap(), dst.path().to_str().unwrap(), true).unwrap();
+
+        assert_eq!(fs::read(dst.path().join("f.txt")).unwrap(), b"new");
     }
 
     #[test]
     fn backup_copy_errors_on_missing_src() {
         let dst = tempfile::tempdir().unwrap();
-        let result = backup_copy("/nonexistent/path/opz", dst.path().to_str().unwrap());
-        assert!(result.is_err());
+        assert!(backup_copy("/nonexistent/path/opz", dst.path().to_str().unwrap(), false).is_err());
     }
 
-    // ── list_backups ─────────────────────────────────────────────────────────
+    // ── load_backups / list_backups ──────────────────────────────────────────
 
     #[test]
-    fn list_backups_errors_when_root_missing() {
+    fn load_backups_returns_sorted_oldest_first() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", root.path()) };
+
+        let b1 = root.path().join("opz-backups").join("2026-03-24_14-30-00");
+        let b2 = root.path().join("opz-backups").join("2026-03-20_10-00-00");
+        fs::create_dir_all(&b1).unwrap();
+        fs::create_dir_all(&b2).unwrap();
+
+        let entries = load_backups().unwrap();
+        assert_eq!(entries[0].0, "2026-03-20_10-00-00");
+        assert_eq!(entries[1].0, "2026-03-24_14-30-00");
+    }
+
+    #[test]
+    fn load_backups_errors_when_root_missing() {
         let _lock = HOME_LOCK.lock().unwrap();
         unsafe { std::env::set_var("HOME", "/nonexistent/path/that/does/not/exist") };
-        let result = list_backups();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no backups found"));
+        assert!(load_backups().is_err());
     }
 
     #[test]
@@ -282,7 +335,6 @@ devfs                396        396          0     100% /dev";
         let root = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("HOME", root.path()) };
 
-        // Create two fake timestamped backup dirs with a file each
         let b1 = root.path().join("opz-backups").join("2026-03-20_10-00-00");
         let b2 = root.path().join("opz-backups").join("2026-03-24_14-30-00");
         fs::create_dir_all(&b1).unwrap();
