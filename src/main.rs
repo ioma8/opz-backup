@@ -1,7 +1,27 @@
+use clap::{Parser, Subcommand};
 use fs_extra::dir::{CopyOptions, TransitProcess, copy_with_progress};
 use human_bytes::human_bytes;
 use ml_progress::progress;
 use std::process::Command;
+
+#[derive(Parser)]
+#[command(
+    name = "opz-backup",
+    about = "Back up and restore your OP-Z",
+    after_help = "With no subcommand, backs up the connected OP-Z to ~/opz-backups.",
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List all existing backups with their sizes
+    List,
+    /// Interactively select and restore a backup to the OP-Z
+    Restore,
+}
 
 fn hb(n: u64) -> String { human_bytes(n as f64) }
 
@@ -143,10 +163,10 @@ fn restore() -> Result<(), String> {
 }
 
 fn main() {
-    let result: Result<(), String> = match std::env::args().nth(1).as_deref() {
-        Some("list")    => list_backups(),
-        Some("restore") => restore(),
-        _               => run().map(|b| println!("✓ {} copied", hb(b))),
+    let result: Result<(), String> = match Cli::parse().command {
+        None                => run().map(|b| println!("✓ {} copied", hb(b))),
+        Some(Cmd::List)     => list_backups(),
+        Some(Cmd::Restore)  => restore(),
     };
     if let Err(e) = result {
         eprintln!("✗ {}", e);
